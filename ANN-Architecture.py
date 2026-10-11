@@ -7,7 +7,7 @@ import seaborn as sns
 # 1. SIMULATED DATASET (6 FEATURES)
 # -------------------------
 print("="*80)
-print("CBR PREDICTION USING TLBO-TRAINED ANN (6 INPUTS)")
+print("CBR PREDICTION USING MGO-TRAINED ANN (6 INPUTS)")
 print("="*80)
 
 np.random.seed(42)
@@ -29,7 +29,7 @@ CBR_min = 2.90
 CBR_max = 19.04
 
 # -------------------------
-# 2. TLBO-ANN MODEL PARAMETERS (6 → 6 → 1)
+# 2. MGO-ANN MODEL PARAMETERS (6 → 6 → 1)
 # -------------------------
 W1 = np.array([
     [-0.2536, -0.1101, 0.0764, 0.5012, -0.3024, 0.4061],
