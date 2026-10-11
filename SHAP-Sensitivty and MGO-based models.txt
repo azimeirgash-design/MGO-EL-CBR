@@ -1,0 +1,741 @@
+# =============================================================================
+#  cbr_mgo_shap.py
+#  MGO-optimized ensemble (ANN + Ridge + XGBoost) with SHAP sensitivity
+#  Target : CBR (Y1)      Features : G, S, F, PI, MDD, OMC
+# =============================================================================
+import os, random, warnings, math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import xgboost as xgb
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
+
+from scipy import stats
+import scipy.special
+
+warnings.filterwarnings('ignore')
+np.random.seed(42); random.seed(42)
+
+OUTDIR = 'mgo_shap_output'
+os.makedirs(OUTDIR, exist_ok=True)
+
+# =============================================================================
+# 1. ROBUST DATA LOADER
+# =============================================================================
+def load_cbr_data(path='SPSS2.xlsx'):
+    """
+    Loads CBR dataset. Handles two common problems with SPSS exports:
+      (a) header row containing 'CBR (Y1)', 'G (X1)', etc.
+      (b) cells holding Excel formulas ('=...') rather than values.
+    Returns (df, feature_names, target_name).
+    """
+    if not os.path.exists(path):
+        print(f"[!] '{path}' not found — using synthetic data.")
+        from sklearn.datasets import make_regression
+        X, y = make_regression(n_samples=400, n_features=6, noise=6.0, random_state=42)
+        cols = ['G','S','F','PI','MDD','OMC']
+        df = pd.DataFrame(X, columns=cols); df.insert(0, 'CBR', y)
+        return df, cols, 'CBR'
+
+    # --- attempt 1: openpyxl cached values (recovers formula results) ---
+    df = None
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
+        data = list(ws.values)
+        df = pd.DataFrame(data[1:], columns=data[0])
+        # Are the cached values present? (None = formula never calculated)
+        if df.iloc[:, 3:7].isna().all().all():
+            print("[i] openpyxl cached values empty — falling back to pandas.")
+            df = None
+    except Exception as e:
+        print(f"[i] openpyxl route failed ({e}) — using pandas.")
+
+    # --- attempt 2: pandas (formulas read as strings) ---
+    if df is None:
+        df = pd.read_excel(path)
+
+    df.columns = [str(c).strip() for c in df.columns]
+    print('Columns read:', list(df.columns))
+
+    # --- normalise target + feature names ---
+    rename_map = {}
+    for c in df.columns:
+        cu = c.upper().replace(' ', '')
+        if   cu.startswith('CBR'):                 rename_map[c] = 'CBR'
+        elif cu.startswith('G(')  or cu == 'G':    rename_map[c] = 'G'
+        elif cu.startswith('S(')  or cu == 'S':    rename_map[c] = 'S'
+        elif cu.startswith('F(')  or cu == 'F':    rename_map[c] = 'F'
+        elif cu.startswith('PI'):                  rename_map[c] = 'PI'
+        elif cu.startswith('MDD'):                 rename_map[c] = 'MDD'
+        elif cu.startswith('OMC'):                 rename_map[c] = 'OMC'
+    df = df.rename(columns=rename_map)
+
+    # --- coerce numeric; detect formula-string columns ---
+    formula_cols = []
+    for c in df.columns:
+        s = df[c]
+        if s.dtype == object:
+            head = s.dropna().astype(str).head(5)
+            if len(head) and head.str.startswith('=').all():
+                formula_cols.append(c)
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    if formula_cols:
+        print(f"\n[!] These columns still contain Excel formulas and became NaN: {formula_cols}")
+        print("    FIX: open SPSS2.xlsx → select those columns → Copy → "
+              "Paste-Special → Values Only → Save.  Without this, they are dropped.\n")
+
+    df = df.dropna().reset_index(drop=True)
+
+    target = 'CBR' if 'CBR' in df.columns else df.columns[0]
+    features = [c for c in df.columns if c != target]
+    print(f"Final dataset: {df.shape[0]} rows, {len(features)} features {features}")
+    print(f"Target      : {target}")
+    return df, features, target
+
+
+# =============================================================================
+# 2. BASIC MGO
+# =============================================================================
+class BasicMountainGazelleOptimization:
+    def __init__(self, n_gazelles=30, n_iterations=100, lb=-10, ub=10):
+        self.n_gazelles   = n_gazelles
+        self.n_iterations = n_iterations
+        self.lb, self.ub  = lb, ub
+        self.positions = self.fitness = None
+        self.best_position = None
+        self.best_fitness  = float('inf')
+
+    def initialize_population(self, dim):
+        self.dim       = dim
+        self.positions = np.random.uniform(self.lb, self.ub, (self.n_gazelles, dim))
+        self.fitness   = np.full(self.n_gazelles, float('inf'))
+
+    def evaluate_fitness(self, fn):
+        for i in range(self.n_gazelles):
+            self.fitness[i] = fn(self.positions[i])
+            if self.fitness[i] < self.best_fitness:
+                self.best_fitness  = self.fitness[i]
+                self.best_position = self.positions[i].copy()
+
+    def update_positions(self, it):
+        a = 2 - it * (2 / max(1, self.n_iterations))
+        for i in range(self.n_gazelles):
+            r1, r2, r3 = np.random.random(3)
+            if r1 < 0.5:
+                D = np.abs(r2 * self.best_position - self.positions[i])
+                self.positions[i] = self.best_position - a * D
+            else:
+                g = self.positions[np.random.randint(0, self.n_gazelles)]
+                D = np.abs(r3 * g - self.positions[i])
+                self.positions[i] = g - a * D
+            self.positions[i] = np.clip(self.positions[i], self.lb, self.ub)
+
+
+# =============================================================================
+# 3. IMPROVED MGO (LHS init + adaptive params + Levy flight + crossover)
+# =============================================================================
+class ImprovedMountainGazelleOptimization:
+    def __init__(self, n_gazelles=40, n_iterations=100, lb=-5, ub=5):
+        self.n_gazelles   = n_gazelles
+        self.n_iterations = n_iterations
+        self.lb, self.ub  = lb, ub
+        self.positions = self.fitness = None
+        self.best_position = None
+        self.best_fitness  = float('inf')
+        self.convergence_history = []
+        self.adaptive_parameters = {}
+
+    def latin_hypercube_sampling(self, dim):
+        samples = np.zeros((self.n_gazelles, dim))
+        for i in range(dim):
+            samples[:, i] = np.random.permutation(
+                np.linspace(self.lb, self.ub, self.n_gazelles))
+        return samples + np.random.uniform(-0.05, 0.05, (self.n_gazelles, dim))
+
+    def initialize_population(self, dim):
+        self.dim       = dim
+        self.positions = self.latin_hypercube_sampling(dim)
+        self.fitness   = np.full(self.n_gazelles, float('inf'))
+        self.adaptive_parameters = {'exploration_rate': 0.9,
+                                    'exploitation_rate': 0.1,
+                                    'mutation_rate': 0.3}
+
+    def evaluate_fitness(self, fn):
+        for i in range(self.n_gazelles):
+            self.fitness[i] = fn(self.positions[i])
+            if self.fitness[i] < self.best_fitness:
+                self.best_fitness  = self.fitness[i]
+                self.best_position = self.positions[i].copy()
+
+    def adaptive_parameter_control(self, it):
+        p = it / self.n_iterations
+        e = 0.9 * (1 - p) ** 2
+        x = 0.1 + 0.8 * p ** 2
+        m = 0.3 * (1 - p)
+        self.adaptive_parameters = {'exploration_rate': e,
+                                    'exploitation_rate': x,
+                                    'mutation_rate': m}
+        return e, x, m
+
+    def levy_flight(self, dim, beta=1.5):
+        sigma = (scipy.special.gamma(1 + beta) * np.sin(np.pi * beta / 2) /
+                 (scipy.special.gamma((1 + beta) / 2) * beta *
+                  (2 ** ((beta - 1) / 2)))) ** (1 / beta)
+        u = np.random.normal(0, sigma, dim)
+        v = np.random.normal(0, 1, dim)
+        return 0.01 * u / (np.abs(v) ** (1 / beta))
+
+    def crossover(self, p1, p2):
+        a = np.random.random()
+        return a * p1 + (1 - a) * p2
+
+    def mutation(self, ind, strength):
+        mask = np.random.random(self.dim) < self.adaptive_parameters['mutation_rate']
+        return ind + mask * strength * np.random.normal(0, 1, self.dim)
+
+    def update_positions(self, it):
+        e, x, m = self.adaptive_parameter_control(it)
+        order = np.argsort(self.fitness)
+        for i in range(self.n_gazelles):
+            r1, r2, r3, r4 = np.random.random(4)
+            if i < self.n_gazelles * 0.1:                     # elite
+                if r1 < x:
+                    self.positions[i] += 0.5 * (self.best_position - self.positions[i]) \
+                                       + 0.1 * np.random.normal(0, 0.1, self.dim)
+                else:
+                    self.positions[i] += self.levy_flight(self.dim)
+            elif i < self.n_gazelles * 0.8:                   # middle
+                if r2 < 0.6:
+                    mentor = order[np.random.randint(0, max(1, i // 2))]
+                    self.positions[i] += 0.3 * (self.positions[mentor] - self.positions[i])
+                else:
+                    partner = np.random.randint(0, self.n_gazelles)
+                    self.positions[i] = self.crossover(self.positions[i],
+                                                       self.positions[partner])
+            else:                                             # weak
+                if r3 < e:
+                    self.positions[i] = self.mutation(self.positions[i], 0.5)
+                else:
+                    if r4 < 0.3:
+                        self.positions[i] = self.best_position + 0.2 * np.random.normal(0, 1, self.dim)
+                    else:
+                        self.positions[i] = self.lb + (self.ub - self.lb) * np.random.random(self.dim)
+            # reflect at bounds
+            for d in range(self.dim):
+                if   self.positions[i, d] < self.lb: self.positions[i, d] = 2*self.lb - self.positions[i, d]
+                elif self.positions[i, d] > self.ub: self.positions[i, d] = 2*self.ub - self.positions[i, d]
+            self.positions[i] = np.clip(self.positions[i], self.lb, self.ub)
+
+
+# =============================================================================
+# 4. HYBRID MODELS
+# =============================================================================
+class BaseHybridModel:
+    """Common logic for Basic + Improved hybrid models."""
+    def _build_ann(self, input_dim, units, improved=False):
+        m = Sequential()
+        first = True
+        for u in units:
+            if first:
+                m.add(Dense(u, activation='relu', input_dim=input_dim,
+                            kernel_regularizer=l2(0.001) if improved else None))
+                first = False
+            else:
+                m.add(Dense(u, activation='relu',
+                            kernel_regularizer=l2(0.001) if improved else None))
+            if improved:
+                m.add(BatchNormalization())
+            m.add(Dropout(0.3 if improved else 0.2))
+        m.add(Dense(1, activation='linear'))
+        m.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+        return m
+
+    def get_individual_predictions(self, X):
+        Xs = self.scaler.transform(X)
+        a = self.ann_model.predict(Xs, verbose=0).flatten()
+        r = self.ridge_model.predict(Xs)
+        g = self.xgb_model.predict(Xs)
+        return np.column_stack([a, r, g])
+
+    def predict(self, X):
+        preds = self.get_individual_predictions(X)
+        return np.sum(preds * self.optimal_weights, axis=1)
+
+    def evaluate(self, X, y_true):
+        p = self.predict(X)
+        return dict(RMSE=float(np.sqrt(mean_squared_error(y_true, p))),
+                    MAE=float(mean_absolute_error(y_true, p)),
+                    R2=float(r2_score(y_true, p)),
+                    MAPE=float(np.mean(np.abs((y_true - p) /
+                                              np.maximum(np.abs(y_true), 1e-8))) * 100),
+                    Predictions=p, Weights=self.optimal_weights)
+
+    def evaluate_individual_models(self, X, y_true):
+        Xs = self.scaler.transform(X)
+        ann  = self.ann_model.predict(Xs, verbose=0).flatten()
+        rid  = self.ridge_model.predict(Xs)
+        xg   = self.xgb_model.predict(Xs)
+        out = {}
+        for name, pred in [('ANN', ann), ('Ridge', rid), ('XGBoost', xg)]:
+            out[name] = dict(Predictions=pred,
+                             R2=float(r2_score(y_true, pred)),
+                             RMSE=float(np.sqrt(mean_squared_error(y_true, pred))),
+                             MAE=float(mean_absolute_error(y_true, pred)))
+        return out
+
+
+class BasicHybridModel(BaseHybridModel):
+    def __init__(self, ann_units=(64, 32), ridge_alpha=1.0, xgb_params=None,
+                 n_gazelles=20, n_iterations=50):
+        self.ann_units   = list(ann_units)
+        self.ridge_alpha = ridge_alpha
+        self.xgb_params  = xgb_params or {'max_depth': 6, 'learning_rate': 0.1,
+                                          'n_estimators': 100}
+        self.n_gazelles, self.n_iterations = n_gazelles, n_iterations
+        self.scaler = StandardScaler()
+
+    def train_base_models(self, Xtr, ytr, Xv, yv, epochs=100):
+        Xtr_s = self.scaler.fit_transform(Xtr); Xv_s = self.scaler.transform(Xv)
+        print("  · training Plain ANN")
+        self.ann_model = self._build_ann(Xtr.shape[1], self.ann_units, improved=False)
+        self.ann_model.fit(Xtr_s, ytr, validation_data=(Xv_s, yv),
+                           epochs=epochs, batch_size=32, verbose=0)
+        print("  · training Plain Ridge")
+        self.ridge_model = Ridge(alpha=self.ridge_alpha).fit(Xtr_s, ytr)
+        print("  · training Plain XGBoost")
+        self.xgb_model = xgb.XGBRegressor(**self.xgb_params, verbosity=0).fit(Xtr_s, ytr)
+
+    def optimize_weights(self, Xv, yv):
+        mgo = BasicMountainGazelleOptimization(self.n_gazelles,
+                                               self.n_iterations, 0.1, 10.0)
+        def fit(w):
+            w = np.abs(w); w = w / (w.sum() + 1e-12)
+            p = np.sum(self.get_individual_predictions(Xv) * w, axis=1)
+            return np.sqrt(mean_squared_error(yv, p))
+        mgo.initialize_population(3)
+        for it in range(self.n_iterations):
+            mgo.evaluate_fitness(fit); mgo.update_positions(it)
+        w = np.abs(mgo.best_position); self.optimal_weights = w / w.sum()
+        print("  Basic weights:", self.optimal_weights.round(3))
+        return self.optimal_weights
+
+
+class ImprovedHybridModel(BaseHybridModel):
+    def __init__(self, ann_units=(128, 64, 32), ridge_alpha=0.5, xgb_params=None,
+                 n_gazelles=40, n_iterations=100):
+        self.ann_units   = list(ann_units)
+        self.ridge_alpha = ridge_alpha
+        self.xgb_params  = xgb_params or {'max_depth': 8, 'learning_rate': 0.05,
+                                          'n_estimators': 200, 'subsample': 0.8,
+                                          'colsample_bytree': 0.8, 'reg_alpha': 0.1,
+                                          'reg_lambda': 0.1}
+        self.n_gazelles, self.n_iterations = n_gazelles, n_iterations
+        self.scaler = StandardScaler()
+        self.convergence_history = []
+
+    def train_base_models(self, Xtr, ytr, Xv, yv, epochs=200):
+        Xtr_s = self.scaler.fit_transform(Xtr); Xv_s = self.scaler.transform(Xv)
+        print("  · training MGO-ANN")
+        self.ann_model = self._build_ann(Xtr.shape[1], self.ann_units, improved=True)
+        self.ann_model.fit(
+            Xtr_s, ytr, validation_data=(Xv_s, yv),
+            epochs=epochs, batch_size=32, verbose=0,
+            callbacks=[EarlyStopping(patience=25, restore_best_weights=True,
+                                     monitor='val_loss'),
+                       ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                                         patience=10, min_lr=1e-7)])
+        print("  · training MGO-Ridge")
+        self.ridge_model = Ridge(alpha=self.ridge_alpha,
+                                 random_state=42).fit(Xtr_s, ytr)
+        print("  · training MGO-XGBoost")
+        self.xgb_model = xgb.XGBRegressor(**self.xgb_params,
+                                          random_state=42,
+                                          verbosity=0).fit(Xtr_s, ytr)
+
+    def optimize_weights(self, Xv, yv):
+        mgo = ImprovedMountainGazelleOptimization(self.n_gazelles,
+                                                  self.n_iterations, 0.01, 5.0)
+        def fit(w):
+            w = np.abs(w); w = w / (w.sum() + 1e-12)
+            p = np.sum(self.get_individual_predictions(Xv) * w, axis=1)
+            mse = mean_squared_error(yv, p)
+            mae = mean_absolute_error(yv, p)
+            r2  = r2_score(yv, p)
+            return np.sqrt(mse) + 0.5 * mae - 0.2 * r2 + 0.01 * np.sum(w**2)
+        mgo.initialize_population(3)
+        for it in range(self.n_iterations):
+            mgo.evaluate_fitness(fit); mgo.update_positions(it)
+            self.convergence_history.append(mgo.best_fitness)
+        w = np.abs(mgo.best_position); self.optimal_weights = w / w.sum()
+        print("  Improved weights:", self.optimal_weights.round(3))
+        return self.optimal_weights
+
+
+# =============================================================================
+# 5. SHAP ANALYSIS
+# =============================================================================
+def _shap_ann(ann_model, X_bg, X_expl, bg_n=100):
+    """Try GradientExplainer → DeepExplainer → KernelExplainer."""
+    import shap
+    bg_idx = np.random.choice(len(X_bg), size=min(bg_n, len(X_bg)), replace=False)
+    bg     = X_bg[bg_idx]
+
+    try:
+        e  = shap.GradientExplainer(ann_model, bg)
+        sv = e.shap_values(X_expl)
+        sv = sv[0] if isinstance(sv, list) else sv
+        sv = np.squeeze(sv)
+        base = float(np.mean(ann_model.predict(bg, verbose=0)))
+        print("    ANN: GradientExplainer ✓")
+        return sv, base, X_expl
+    except Exception as e1:
+        print(f"    ANN: GradientExplainer failed ({type(e1).__name__})")
+
+    try:
+        e  = shap.DeepExplainer(ann_model, bg)
+        sv = e.shap_values(X_expl)
+        sv = sv[0] if isinstance(sv, list) else sv
+        sv = np.squeeze(sv)
+        base = float(np.array(e.expected_value).ravel()[0])
+        print("    ANN: DeepExplainer ✓")
+        return sv, base, X_expl
+    except Exception as e2:
+        print(f"    ANN: DeepExplainer failed ({type(e2).__name__}) "
+              f"— using KernelExplainer (slow)")
+
+    n_use = min(80, len(X_expl))
+    X_expl = X_expl[:n_use]
+    e  = shap.KernelExplainer(
+        lambda x: ann_model.predict(x, verbose=0).flatten(), bg)
+    sv = e.shap_values(X_expl, nsamples=150)
+    base = float(np.array(e.expected_value).ravel()[0])
+    return sv, base, X_expl
+
+
+def run_shap_analysis(model, X_train, X_test, feature_names,
+                      outdir='mgo_shap_output'):
+    """SHAP for the MGO ensemble — exploits additivity."""
+    import shap
+    os.makedirs(outdir, exist_ok=True)
+    print("\n── SHAP ─────────────────────────────────────────")
+
+    Xtr_s = model.scaler.transform(X_train)
+    Xte_s = model.scaler.transform(X_test)
+
+    # Ridge — exact linear SHAP
+    print("  Ridge  …")
+    r_expl  = shap.LinearExplainer(model.ridge_model, Xtr_s)
+    sh_rid  = r_expl.shap_values(Xte_s)
+    b_rid   = float(np.array(r_expl.expected_value).ravel()[0])
+
+    # XGBoost — exact tree SHAP
+    print("  XGBoost…")
+    t_expl  = shap.TreeExplainer(model.xgb_model)
+    sh_xgb  = t_expl.shap_values(Xte_s)
+    if isinstance(sh_xgb, list): sh_xgb = sh_xgb[0]
+    b_xgb   = float(np.array(t_expl.expected_value).ravel()[0])
+
+    # ANN
+    print("  ANN    …")
+    sh_ann, b_ann, Xte_s = _shap_ann(model.ann_model, Xtr_s, Xte_s)
+    n = len(Xte_s)
+    X_test = X_test[:n]; sh_rid = sh_rid[:n]; sh_xgb = sh_xgb[:n]
+
+    # Combine via additive property
+    w = model.optimal_weights
+    print(f"  MGO weights → ANN={w[0]:.3f}  Ridge={w[1]:.3f}  XGB={w[2]:.3f}")
+    contrib_ann = w[0] * sh_ann
+    contrib_rid = w[1] * sh_rid
+    contrib_xgb = w[2] * sh_xgb
+    sh_ens_s    = contrib_ann + contrib_rid + contrib_xgb
+    base_ens    = w[0]*b_ann + w[1]*b_rid + w[2]*b_xgb
+
+    # Undo standardisation → original units
+    scale = model.scaler.scale_
+    sh_ens      = sh_ens_s    / scale
+    contrib_ann = contrib_ann / scale
+    contrib_rid = contrib_rid / scale
+    contrib_xgb = contrib_xgb / scale
+
+    # ---------- (1) Bar ----------
+    plt.figure()
+    shap.summary_plot(sh_ens, X_test, feature_names=feature_names,
+                      plot_type='bar', show=False)
+    plt.title('SHAP Importance — MGO Ensemble', fontweight='bold')
+    plt.tight_layout(); plt.savefig(f'{outdir}/01_shap_bar.png',
+                                    dpi=300, bbox_inches='tight'); plt.show()
+
+    # ---------- (2) Beeswarm ----------
+    plt.figure()
+    shap.summary_plot(sh_ens, X_test, feature_names=feature_names, show=False)
+    plt.title('SHAP Summary — MGO Ensemble', fontweight='bold')
+    plt.tight_layout(); plt.savefig(f'{outdir}/02_shap_beeswarm.png',
+                                    dpi=300, bbox_inches='tight'); plt.show()
+
+    # ---------- (3) Waterfall — most extreme prediction ----------
+    preds = model.predict(X_test)
+    idx   = int(np.argmax(np.abs(preds - preds.mean())))
+    expl  = shap.Explanation(values=sh_ens[idx], base_values=base_ens,
+                             data=X_test[idx], feature_names=feature_names)
+    plt.figure()
+    shap.waterfall_plot(expl, max_display=12, show=False)
+    plt.title(f'SHAP Waterfall — sample #{idx}', fontweight='bold')
+    plt.tight_layout(); plt.savefig(f'{outdir}/03_shap_waterfall.png',
+                                    dpi=300, bbox_inches='tight'); plt.show()
+
+    # ---------- (4) Decision ----------
+    n_dec = min(20, len(sh_ens))
+    plt.figure()
+    shap.decision_plot(base_ens, sh_ens[:n_dec], X_test[:n_dec],
+                       feature_names=feature_names, show=False)
+    plt.title('SHAP Decision Plot', fontweight='bold')
+    plt.tight_layout(); plt.savefig(f'{outdir}/04_shap_decision.png',
+                                    dpi=300, bbox_inches='tight'); plt.show()
+
+    # ---------- (5) Dependence — top 4 ----------
+    mean_abs = np.abs(sh_ens).mean(axis=0)
+    top4 = np.argsort(mean_abs)[::-1][:min(4, len(feature_names))]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    for ax, fi in zip(axes.ravel(), top4):
+        shap.dependence_plot(fi, sh_ens, X_test,
+                             feature_names=feature_names, ax=ax, show=False)
+        ax.set_title(f'Dependence — {feature_names[fi]}', fontweight='bold')
+    for ax in axes.ravel()[len(top4):]: ax.axis('off')
+    plt.tight_layout(); plt.savefig(f'{outdir}/05_shap_dependence.png',
+                                    dpi=300, bbox_inches='tight'); plt.show()
+
+    # ---------- (6) Per-base-model bar ----------
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, (name, c, wi) in zip(
+        axes,
+        [('ANN',     contrib_ann, w[0]),
+         ('Ridge',   contrib_rid, w[1]),
+         ('XGBoost', contrib_xgb, w[2])]):
+        imp   = np.abs(c).mean(axis=0)
+        order = np.argsort(imp)[::-1]
+        ax.barh([feature_names[i] for i in order], imp[order],
+                color='#2E5A88', alpha=0.85, edgecolor='black')
+        ax.set_xlabel('mean |SHAP contribution|')
+        ax.set_title(f'{name}  (w = {wi:.3f})', fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='x')
+    plt.suptitle('Per-base-model SHAP contribution', fontweight='bold')
+    plt.tight_layout(); plt.savefig(f'{outdir}/06_shap_per_model.png',
+                                    dpi=300, bbox_inches='tight'); plt.show()
+
+    # ---------- (7) Stacked bar ----------
+    fig, ax = plt.subplots(figsize=(10, 6))
+    stacked = np.vstack([np.abs(contrib_ann).mean(axis=0),
+                         np.abs(contrib_rid).mean(axis=0),
+                         np.abs(contrib_xgb).mean(axis=0)])
+    x = np.arange(len(feature_names))
+    ax.bar(x, stacked[0], label=f'ANN (w={w[0]:.2f})',     color='#1f77b4')
+    ax.bar(x, stacked[1], bottom=stacked[0],
+           label=f'Ridge (w={w[1]:.2f})', color='#ff7f0e')
+    ax.bar(x, stacked[2], bottom=stacked[0]+stacked[1],
+           label=f'XGBoost (w={w[2]:.2f})', color='#2ca02c')
+    ax.set_xticks(x); ax.set_xticklabels(feature_names, rotation=45)
+    ax.set_ylabel('mean |SHAP contribution| (stacked)')
+    ax.set_title('Base-model contribution per feature', fontweight='bold')
+    ax.legend(); ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout(); plt.savefig(f'{outdir}/07_shap_stacked.png',
+                                    dpi=300, bbox_inches='tight'); plt.show()
+
+    # ---------- (8) Heatmap ----------
+    try:
+        plt.figure()
+        shap.plots.heatmap(
+            shap.Explanation(values=sh_ens,
+                             base_values=np.full(len(sh_ens), base_ens),
+                             data=X_test, feature_names=feature_names),
+            show=False)
+        plt.title('SHAP Heatmap', fontweight='bold')
+        plt.tight_layout(); plt.savefig(f'{outdir}/08_shap_heatmap.png',
+                                        dpi=300, bbox_inches='tight'); plt.show()
+    except Exception as e:
+        print(f"  [i] heatmap skipped: {e}")
+
+    # ---------- ranking ----------
+    ranking = pd.Series(np.abs(sh_ens).mean(axis=0),
+                        index=feature_names).sort_values(ascending=False)
+    print("\n  SHAP ranking (mean |SHAP|):")
+    print(ranking.round(4).to_string())
+    ranking.to_csv(f'{outdir}/shap_ranking.csv', header=['mean_abs_shap'])
+    return dict(shap_values=sh_ens, base_value=base_ens, ranking=ranking)
+
+
+# =============================================================================
+# 6. COMPARISON PLOTS
+# =============================================================================
+def comparison_plot(basic_res, improved_res, basic_ind, improved_ind,
+                    y_test, feature_names, outdir='mgo_shap_output'):
+    fig = plt.figure(figsize=(20, 11))
+    gs  = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.28)
+
+    labels = ['Plain\nANN', 'Plain\nRidge', 'Plain\nXGB',
+              'MGO\nANN', 'MGO\nRidge', 'MGO\nXGB',
+              'Basic\nEnsemble', 'MGO\nEnsemble']
+    r2_vals   = [basic_ind['ANN']['R2'], basic_ind['Ridge']['R2'],
+                 basic_ind['XGBoost']['R2'], improved_ind['ANN']['R2'],
+                 improved_ind['Ridge']['R2'], improved_ind['XGBoost']['R2'],
+                 basic_res['R2'], improved_res['R2']]
+    rmse_vals = [basic_ind['ANN']['RMSE'], basic_ind['Ridge']['RMSE'],
+                 basic_ind['XGBoost']['RMSE'], improved_ind['ANN']['RMSE'],
+                 improved_ind['Ridge']['RMSE'], improved_ind['XGBoost']['RMSE'],
+                 basic_res['RMSE'], improved_res['RMSE']]
+    mae_vals  = [basic_ind['ANN']['MAE'], basic_ind['Ridge']['MAE'],
+                 basic_ind['XGBoost']['MAE'], improved_ind['ANN']['MAE'],
+                 improved_ind['Ridge']['MAE'], improved_ind['XGBoost']['MAE'],
+                 basic_res['MAE'], improved_res['MAE']]
+    colors = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b',
+              '#2E5A88','#FF6B35']
+
+    for ax, vals, title in zip(
+        [fig.add_subplot(gs[0,0]), fig.add_subplot(gs[0,1]), fig.add_subplot(gs[0,2])],
+        [r2_vals, rmse_vals, mae_vals],
+        ['R²', 'RMSE', 'MAE']):
+        bars = ax.bar(labels, vals, color=colors, alpha=0.85, edgecolor='black')
+        ax.set_title(f'{title} comparison', fontweight='bold')
+        ax.tick_params(axis='x', rotation=45); ax.grid(True, alpha=0.3, axis='y')
+        for b, v in zip(bars, vals):
+            ax.text(b.get_x()+b.get_width()/2, b.get_height(),
+                    f'{v:.3f}' if title == 'R²' else f'{v:.2f}',
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    for ax, dict_a, dict_b, ttl in [
+        (fig.add_subplot(gs[1,0]), basic_ind,    improved_ind, 'Plain vs MGO models'),
+        (fig.add_subplot(gs[1,1]), basic_ind,    improved_ind, 'Individual models'),
+        (fig.add_subplot(gs[1,2]), None,         None,         'Ensembles')]:
+
+        if ax is None: continue
+
+        if ttl == 'Ensembles':
+            ax.scatter(y_test, basic_res['Predictions'], alpha=0.6, s=45,
+                       color='#2E5A88', label=f"Basic  R²={basic_res['R2']:.3f}")
+            ax.scatter(y_test, improved_res['Predictions'], alpha=0.6, s=45,
+                       color='#FF6B35', label=f"MGO    R²={improved_res['R2']:.3f}")
+        else:
+            for name, c in zip(['ANN','Ridge','XGBoost'],
+                               ['#1f77b4','#ff7f0e','#2ca02c']):
+                if ttl == 'Plain vs MGO models':
+                    ax.scatter(y_test, dict_a[name]['Predictions'], alpha=0.45,
+                               s=30, color=c, label=f"Plain {name}")
+                    ax.scatter(y_test, dict_b[name]['Predictions'], alpha=0.45,
+                               s=30, color=c, marker='^',
+                               label=f"MGO {name}")
+                else:
+                    ax.scatter(y_test, dict_b[name]['Predictions'], alpha=0.55,
+                               s=40, color=c,
+                               label=f"{name} R²={dict_b[name]['R2']:.3f}")
+
+        lim = [min(y_test.min(), np.min(y_test)), max(y_test.max(), np.max(y_test))]
+        ax.plot(lim, lim, 'k--', lw=1.2, alpha=0.7)
+        ax.set_xlabel('Measured CBR'); ax.set_ylabel('Predicted CBR')
+        ax.set_title(ttl, fontweight='bold')
+        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    plt.suptitle('Model comparison: Plain vs MGO-optimized ensemble',
+                 fontweight='bold', y=1.02)
+    plt.savefig(f'{outdir}/00_comparison.png', dpi=300,
+                bbox_inches='tight', facecolor='white')
+    plt.show()
+
+
+# =============================================================================
+# 7. MAIN
+# =============================================================================
+def main():
+    print("="*72)
+    print("  MGO-optimized ensemble for CBR prediction + SHAP sensitivity")
+    print("="*72)
+
+    # ---- data ----
+    df, feature_cols, target = load_cbr_data('SPSS2.xlsx')
+    X = df[feature_cols].values.astype(float)
+    y = df[target].values.astype(float)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.15, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.15, random_state=42)
+
+    print(f"\nSplits  →  Train {X_train.shape} | Val {X_val.shape} | Test {X_test.shape}")
+    print(f"Features: {feature_cols}\n")
+
+    # ---- BASIC ----
+    print("─"*72); print("BASIC ENSEMBLE (Plain ANN, Ridge, XGBoost)"); print("─"*72)
+    basic = BasicHybridModel(ann_units=(64,32), ridge_alpha=1.0,
+                             xgb_params={'max_depth':6,'learning_rate':0.1,
+                                         'n_estimators':100},
+                             n_gazelles=20, n_iterations=50)
+    basic.train_base_models(X_train, y_train, X_val, y_val, epochs=100)
+    basic.optimize_weights(X_val, y_val)
+    basic_res = basic.evaluate(X_test, y_test)
+    basic_ind = basic.evaluate_individual_models(X_test, y_test)
+    print(f"  Basic ensemble  R²={basic_res['R2']:.4f}  "
+          f"RMSE={basic_res['RMSE']:.3f}  MAE={basic_res['MAE']:.3f}")
+
+    # ---- IMPROVED ----
+    print("\n" + "─"*72); print("MGO-OPTIMIZED ENSEMBLE"); print("─"*72)
+    imp = ImprovedHybridModel(ann_units=(128,64,32), ridge_alpha=0.5,
+                              xgb_params={'max_depth':8,'learning_rate':0.05,
+                                          'n_estimators':200,'subsample':0.8,
+                                          'colsample_bytree':0.8,
+                                          'reg_alpha':0.1,'reg_lambda':0.1},
+                              n_gazelles=40, n_iterations=100)
+    imp.train_base_models(X_train, y_train, X_val, y_val, epochs=200)
+    imp.optimize_weights(X_val, y_val)
+    imp_res = imp.evaluate(X_test, y_test)
+    imp_ind = imp.evaluate_individual_models(X_test, y_test)
+    print(f"  MGO ensemble    R²={imp_res['R2']:.4f}  "
+          f"RMSE={imp_res['RMSE']:.3f}  MAE={imp_res['MAE']:.3f}  "
+          f"MAPE={imp_res['MAPE']:.2f}%")
+
+    # ---- individual summary ----
+    print("\nIndividual models:")
+    print(f"{'':20s}  R²       RMSE     MAE")
+    for name in ['ANN', 'Ridge', 'XGBoost']:
+        print(f"  Plain {name:12s}  {basic_ind[name]['R2']:+.4f}  "
+              f"{basic_ind[name]['RMSE']:.3f}   {basic_ind[name]['MAE']:.3f}")
+    for name in ['ANN', 'Ridge', 'XGBoost']:
+        print(f"  MGO   {name:12s}  {imp_ind[name]['R2']:+.4f}  "
+              f"{imp_ind[name]['RMSE']:.3f}   {imp_ind[name]['MAE']:.3f}")
+
+    # ---- comparison plot ----
+    comparison_plot(basic_res, imp_res, basic_ind, imp_ind,
+                    y_test, feature_cols, OUTDIR)
+
+    # ---- SHAP ----
+    shap_res = run_shap_analysis(imp, X_train, X_test, feature_cols, OUTDIR)
+
+    # ---- save summary ----
+    pd.DataFrame({
+        'Actual': y_test,
+        'Basic_Ensemble': basic_res['Predictions'],
+        'MGO_Ensemble':   imp_res['Predictions'],
+        'Plain_ANN':      basic_ind['ANN']['Predictions'],
+        'Plain_Ridge':    basic_ind['Ridge']['Predictions'],
+        'Plain_XGBoost':  basic_ind['XGBoost']['Predictions'],
+        'MGO_ANN':        imp_ind['ANN']['Predictions'],
+        'MGO_Ridge':      imp_ind['Ridge']['Predictions'],
+        'MGO_XGBoost':    imp_ind['XGBoost']['Predictions'],
+    }).to_csv(f'{OUTDIR}/predictions.csv', index=False)
+
+    print("\n" + "="*72)
+    print(f"All plots + tables saved to ./{OUTDIR}/")
+    print("="*72)
+
+
+if __name__ == '__main__':
+    main()
