@@ -1,0 +1,951 @@
+## improved_combined_mgo_ann_with_stats_and_plots.py
+# =============================================================================
+# 3-way split: Train / Validation / Test
+#   * Base learners  : fit on TRAIN, ANN early-stopped on VAL
+#   * MGO weights    : fit on TRAIN  (clean — val not double-used)
+#   * Metrics        : reported on TRAIN, VAL, TEST in three separate tables
+#
+# MGO settings: α = 5, D = 3, F ∈ [0.1, 1.0], NOP = 100, NOG = 500
+#
+# UPDATED: MGO-ANN trained for 1000 epochs; all other models 500 iterations.
+# UPDATED: Added 5-fold CV × 3 repeats with mean ± SD reporting.
+# =============================================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import random
+import warnings
+import os
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import xgboost as xgb
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
+from tensorflow.keras.regularizers import l2
+
+import scipy.special
+
+warnings.filterwarnings('ignore')
+np.random.seed(42)
+random.seed(42)
+
+MGO_ALPHA = 5.0
+MGO_F_MIN = 0.1
+MGO_F_MAX = 1.0
+MGO_NOP   = 100
+MGO_NOG   = 500
+MGO_DIM   = 3
+TOTAL_ITERATIONS = 500    # Plain ANN, XGBoost, MGO weight-search
+MGO_ANN_EPOCHS   = 1000   # <-- MGO-ANN specific epoch budget
+MAX_EPOCHS       = max(TOTAL_ITERATIONS, MGO_ANN_EPOCHS)
+
+# =============================================================================
+# CUSTOM CALLBACK: Evaluate on TEST set at the end of every epoch
+# =============================================================================
+class TestSetEvaluation(Callback):
+    def __init__(self, X_test, y_test):
+        super().__init__()
+        self.X_test = X_test
+        self.y_test = y_test
+        self.test_rmse = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        preds = self.model.predict(self.X_test, verbose=0).flatten()
+        rmse = np.sqrt(mean_squared_error(self.y_test, preds))
+        self.test_rmse.append(rmse)
+        logs = logs or {}
+        logs['test_rmse'] = rmse
+
+# =============================================================================
+# BASIC MGO
+# =============================================================================
+class BasicMountainGazelleOptimization:
+    def __init__(self, n_gazelles=MGO_NOP, n_iterations=MGO_NOG,
+                 lb=-10, ub=10, dim=None,
+                 alpha=MGO_ALPHA, F_min=MGO_F_MIN, F_max=MGO_F_MAX):
+        self.n_gazelles = n_gazelles
+        self.n_iterations = n_iterations
+        self.lb = lb; self.ub = ub; self.dim = dim
+        self.alpha = alpha; self.F_min = F_min; self.F_max = F_max
+        self.positions = None; self.fitness = None
+        self.best_position = None; self.best_fitness = float('inf')
+
+    def initialize_population(self, dim):
+        self.dim = dim
+        self.positions = np.random.uniform(self.lb, self.ub,
+                                           (self.n_gazelles, dim))
+        self.fitness = np.full(self.n_gazelles, float('inf'))
+
+    def evaluate_fitness(self, fitness_function):
+        for i in range(self.n_gazelles):
+            self.fitness[i] = fitness_function(self.positions[i])
+            if self.fitness[i] < self.best_fitness:
+                self.best_fitness = self.fitness[i]
+                self.best_position = self.positions[i].copy()
+
+    def update_positions(self, iteration):
+        a = self.alpha * (1.0 - iteration / max(1, self.n_iterations))
+        for i in range(self.n_gazelles):
+            r1, r2, r3 = np.random.random(3)
+            F = np.random.uniform(self.F_min, self.F_max, self.dim)
+            if r1 < 0.5:
+                D_pred = np.abs(r2 * self.best_position - self.positions[i])
+                self.positions[i] = self.best_position - F * a * D_pred
+            else:
+                j = np.random.randint(0, self.n_gazelles)
+                rand_gaz = self.positions[j]
+                D_rand = np.abs(r3 * rand_gaz - self.positions[i])
+                self.positions[i] = rand_gaz - F * a * D_rand
+            self.positions[i] = np.clip(self.positions[i], self.lb, self.ub)
+
+
+# =============================================================================
+# IMPROVED MGO
+# =============================================================================
+class ImprovedMountainGazelleOptimization:
+    def __init__(self, n_gazelles=MGO_NOP, n_iterations=MGO_NOG,
+                 lb=-5, ub=5, dim=None,
+                 alpha=MGO_ALPHA, F_min=MGO_F_MIN, F_max=MGO_F_MAX):
+        self.n_gazelles = n_gazelles; self.n_iterations = n_iterations
+        self.lb = lb; self.ub = ub; self.dim = dim
+        self.alpha = alpha; self.F_min = F_min; self.F_max = F_max
+        self.positions = None; self.fitness = None
+        self.best_position = None; self.best_fitness = float('inf')
+        self.convergence_history = []
+        self.adaptive_parameters = {}
+
+    def latin_hypercube_sampling(self, dim):
+        s = np.zeros((self.n_gazelles, dim))
+        for i in range(dim):
+            s[:, i] = np.random.permutation(
+                np.linspace(self.lb, self.ub, self.n_gazelles))
+        return s + np.random.uniform(-0.05, 0.05, (self.n_gazelles, dim))
+
+    def initialize_population(self, dim):
+        self.dim = dim
+        self.positions = self.latin_hypercube_sampling(dim)
+        self.fitness = np.full(self.n_gazelles, float('inf'))
+        self.adaptive_parameters = {
+            'exploration_rate': 0.9,
+            'exploitation_rate': 0.1,
+            'mutation_rate': 0.3}
+
+    def evaluate_fitness(self, fitness_function):
+        for i in range(self.n_gazelles):
+            self.fitness[i] = fitness_function(self.positions[i])
+            if self.fitness[i] < self.best_fitness:
+                self.best_fitness = self.fitness[i]
+                self.best_position = self.positions[i].copy()
+
+    def adaptive_parameter_control(self, iteration):
+        p = iteration / self.n_iterations
+        exploration = 0.9 * (1 - p) ** 2
+        exploitation = 0.1 + 0.8 * p ** 2
+        mutation = 0.3 * (1 - p)
+        self.adaptive_parameters = {
+            'exploration_rate': exploration,
+            'exploitation_rate': exploitation,
+            'mutation_rate': mutation}
+        return exploration, exploitation, mutation
+
+    def levy_flight(self, dim, beta=1.5):
+        sigma = (scipy.special.gamma(1 + beta) * np.sin(np.pi * beta / 2) /
+                 (scipy.special.gamma((1 + beta) / 2) * beta *
+                  (2 ** ((beta - 1) / 2)))) ** (1 / beta)
+        u = np.random.normal(0, sigma, dim)
+        v = np.random.normal(0, 1, dim)
+        return 0.01 * u / (np.abs(v) ** (1 / beta))
+
+    def crossover(self, p1, p2):
+        alpha_c = np.random.random()
+        return alpha_c * p1 + (1 - alpha_c) * p2
+
+    def mutation(self, ind, strength):
+        mask = np.random.random(self.dim) < \
+            self.adaptive_parameters['mutation_rate']
+        return ind + mask * strength * np.random.normal(0, 1, self.dim)
+
+    def update_positions(self, iteration):
+        exploration, exploitation, _ = self.adaptive_parameter_control(iteration)
+        sorted_idx = np.argsort(self.fitness)
+        a = self.alpha * (1.0 - iteration / max(1, self.n_iterations))
+        for i in range(self.n_gazelles):
+            r1, r2, r3, r4 = np.random.random(4)
+            F = np.random.uniform(self.F_min, self.F_max, self.dim)
+            if i < self.n_gazelles * 0.1:
+                if r1 < exploitation:
+                    D = self.best_position - self.positions[i]
+                    self.positions[i] += F * a * 0.5 * D + \
+                        0.1 * F * np.random.normal(0, 0.1, self.dim)
+                else:
+                    self.positions[i] += F * a * self.levy_flight(self.dim)
+            elif i < self.n_gazelles * 0.8:
+                if r2 < 0.6:
+                    m = sorted_idx[np.random.randint(0, max(1, i // 2))]
+                    D_soc = self.positions[m] - self.positions[i]
+                    self.positions[i] += F * a * 0.3 * D_soc
+                else:
+                    partner = np.random.randint(0, self.n_gazelles)
+                    self.positions[i] = self.crossover(
+                        self.positions[i], self.positions[partner])
+            else:
+                if r3 < exploration:
+                    self.positions[i] = self.mutation(self.positions[i], 0.5)
+                else:
+                    if r4 < 0.3:
+                        self.positions[i] = self.best_position + \
+                            0.2 * F * np.random.normal(0, 1, self.dim)
+                    else:
+                        self.positions[i] = self.lb + \
+                            (self.ub - self.lb) * np.random.random(self.dim)
+            for d in range(self.dim):
+                if self.positions[i, d] < self.lb:
+                    self.positions[i, d] = 2 * self.lb - self.positions[i, d]
+                elif self.positions[i, d] > self.ub:
+                    self.positions[i, d] = 2 * self.ub - self.positions[i, d]
+            self.positions[i] = np.clip(self.positions[i], self.lb, self.ub)
+
+
+# =============================================================================
+# BASIC HYBRID MODEL
+# =============================================================================
+class BasicHybridModel:
+    def __init__(self, ann_units=[64, 32], ridge_alpha=1.0,
+                 xgb_params=None, n_gazelles=MGO_NOP, n_iterations=MGO_NOG):
+        self.ann_units = ann_units; self.ridge_alpha = ridge_alpha
+        self.xgb_params = xgb_params or {
+            'max_depth': 6, 'learning_rate': 0.1, 'n_estimators': TOTAL_ITERATIONS}
+        self.n_gazelles = n_gazelles; self.n_iterations = n_iterations
+        self.scaler = StandardScaler()
+        self.ann_model = None; self.ridge_model = None; self.xgb_model = None
+        self.optimal_weights = None; self.mgo = None
+        self.ann_history = None
+        self.test_rmse_history = []
+        self.xgb_history = None
+        self.convergence_history = []
+
+    def create_ann_model(self, input_dim, units):
+        model = Sequential()
+        model.add(Dense(units[0], activation='relu', input_dim=input_dim))
+        model.add(Dropout(0.2))
+        for u in units[1:]:
+            model.add(Dense(u, activation='relu'))
+            model.add(Dropout(0.2))
+        model.add(Dense(1, activation='linear'))
+        model.compile(optimizer=Adam(learning_rate=0.001),
+                      loss='mse', metrics=['mae'])
+        return model
+
+    def train_base_models(self, X_train, y_train, X_val, y_val, X_test, y_test, epochs=TOTAL_ITERATIONS):
+        X_train_s = self.scaler.fit_transform(X_train)
+        X_val_s = self.scaler.transform(X_val)
+        X_test_s = self.scaler.transform(X_test)
+
+        print(f"Training Plain ANN ({epochs} epochs)...")
+        self.ann_model = self.create_ann_model(X_train.shape[1], self.ann_units)
+
+        test_cb = TestSetEvaluation(X_test_s, y_test)
+        self.ann_history = self.ann_model.fit(
+            X_train_s, y_train,
+            validation_data=(X_val_s, y_val),
+            epochs=epochs, batch_size=32, verbose=0,
+            callbacks=[test_cb])
+        self.test_rmse_history = test_cb.test_rmse
+
+        print("Training Ridge...")
+        self.ridge_model = Ridge(alpha=self.ridge_alpha)
+        self.ridge_model.fit(X_train_s, y_train)
+
+        print(f"Training XGBoost ({TOTAL_ITERATIONS} rounds)...")
+        self.xgb_model = xgb.XGBRegressor(
+            **self.xgb_params, verbosity=0, eval_metric='rmse')
+        self.xgb_model.fit(X_train_s, y_train,
+                           eval_set=[(X_val_s, y_val)], verbose=False)
+        self.xgb_history = self.xgb_model.evals_result()
+
+    def get_individual_predictions(self, X):
+        X_s = self.scaler.transform(X)
+        return np.column_stack([
+            self.ann_model.predict(X_s, verbose=0).flatten(),
+            self.ridge_model.predict(X_s),
+            self.xgb_model.predict(X_s)])
+
+    def optimize_weights(self, X_train, y_train):
+        print(f"Optimizing weights (Basic MGO, {self.n_iterations} iterations)...")
+        base_preds = self.get_individual_predictions(X_train)
+        y_arr = np.asarray(y_train).ravel()
+
+        def fitness(w):
+            w = np.abs(w); s = np.sum(w)
+            w = w / s if s > 0 else np.ones_like(w) / len(w)
+            diff = base_preds @ w - y_arr
+            return np.sqrt(np.mean(diff * diff))
+
+        self.mgo = BasicMountainGazelleOptimization(
+            n_gazelles=self.n_gazelles, n_iterations=self.n_iterations,
+            lb=0.1, ub=10.0, alpha=MGO_ALPHA,
+            F_min=MGO_F_MIN, F_max=MGO_F_MAX)
+        self.mgo.initialize_population(dim=MGO_DIM)
+        for it in range(self.n_iterations):
+            self.mgo.evaluate_fitness(fitness)
+            self.mgo.update_positions(it)
+            self.convergence_history.append(self.mgo.best_fitness)
+            if (it + 1) % 100 == 0:
+                print(f"  Iter {it+1}/{self.n_iterations}  "
+                      f"Best RMSE: {self.mgo.best_fitness:.4f}")
+
+        self.optimal_weights = np.abs(self.mgo.best_position)
+        self.optimal_weights /= self.optimal_weights.sum()
+        return self.optimal_weights
+
+    def predict(self, X):
+        return np.sum(self.get_individual_predictions(X) *
+                      self.optimal_weights, axis=1)
+
+    def evaluate_individual_models(self, X, y_true):
+        X_s = self.scaler.transform(X); res = {}
+        ann = self.ann_model.predict(X_s, verbose=0).flatten()
+        res['Plain_ANN'] = {'Predictions': ann,
+                            'R2': r2_score(y_true, ann),
+                            'RMSE': np.sqrt(mean_squared_error(y_true, ann)),
+                            'MAE': mean_absolute_error(y_true, ann)}
+        ridge = self.ridge_model.predict(X_s)
+        res['Plain_Ridge'] = {'Predictions': ridge,
+                              'R2': r2_score(y_true, ridge),
+                              'RMSE': np.sqrt(mean_squared_error(y_true, ridge)),
+                              'MAE': mean_absolute_error(y_true, ridge)}
+        xgb_p = self.xgb_model.predict(X_s)
+        res['Plain_XGBoost'] = {'Predictions': xgb_p,
+                                'R2': r2_score(y_true, xgb_p),
+                                'RMSE': np.sqrt(mean_squared_error(y_true, xgb_p)),
+                                'MAE': mean_absolute_error(y_true, xgb_p)}
+        return res
+
+    def evaluate(self, X, y_true):
+        p = self.predict(X)
+        return {'RMSE': np.sqrt(mean_squared_error(y_true, p)),
+                'MAE': mean_absolute_error(y_true, p),
+                'R2': r2_score(y_true, p),
+                'Predictions': p, 'Weights': self.optimal_weights}
+
+
+# =============================================================================
+# IMPROVED HYBRID MODEL  (MGO-ANN runs 1000 epochs by default)
+# =============================================================================
+class ImprovedHybridModel:
+    def __init__(self, ann_units=[128, 64, 32], ridge_alpha=0.5,
+                 xgb_params=None, n_gazelles=MGO_NOP, n_iterations=MGO_NOG):
+        self.ann_units = ann_units; self.ridge_alpha = ridge_alpha
+        self.xgb_params = xgb_params or {
+            'max_depth': 8, 'learning_rate': 0.05, 'n_estimators': TOTAL_ITERATIONS,
+            'subsample': 0.8, 'colsample_bytree': 0.8,
+            'reg_alpha': 0.1, 'reg_lambda': 0.1}
+        self.n_gazelles = n_gazelles; self.n_iterations = n_iterations
+        self.scaler = StandardScaler()
+        self.ann_model = None; self.ridge_model = None; self.xgb_model = None
+        self.optimal_weights = None; self.mgo = None
+        self.convergence_history = []
+        self.ann_history = None
+        self.test_rmse_history = []
+        self.xgb_history = None
+
+    def create_improved_ann_model(self, input_dim, units):
+        model = Sequential()
+        model.add(Dense(units[0], activation='relu', input_dim=input_dim,
+                        kernel_regularizer=l2(0.001)))
+        model.add(BatchNormalization()); model.add(Dropout(0.3))
+        for u in units[1:]:
+            model.add(Dense(u, activation='relu',
+                            kernel_regularizer=l2(0.001)))
+            model.add(BatchNormalization()); model.add(Dropout(0.3))
+        model.add(Dense(1, activation='linear'))
+        model.compile(
+            optimizer=Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999),
+            loss='mse', metrics=['mae', 'mse'])
+        return model
+
+    def train_improved_base_models(self, X_train, y_train, X_val, y_val,
+                                   X_test, y_test, epochs=MGO_ANN_EPOCHS):
+        X_train_s = self.scaler.fit_transform(X_train)
+        X_val_s = self.scaler.transform(X_val)
+        X_test_s = self.scaler.transform(X_test)
+
+        print(f"Training MGO-ANN ({epochs} epochs)...")
+        self.ann_model = self.create_improved_ann_model(X_train.shape[1], self.ann_units)
+
+        test_cb = TestSetEvaluation(X_test_s, y_test)
+        self.ann_history = self.ann_model.fit(
+            X_train_s, y_train,
+            validation_data=(X_val_s, y_val),
+            epochs=epochs, batch_size=32, verbose=0,
+            callbacks=[
+                # Patience == epoch budget so the full 1000 epochs always run
+                EarlyStopping(patience=epochs, restore_best_weights=True,
+                              monitor='val_loss'),
+                ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                                  patience=10, min_lr=1e-7),
+                test_cb])
+        self.test_rmse_history = test_cb.test_rmse
+
+        print("Training MGO-Ridge...")
+        self.ridge_model = Ridge(alpha=self.ridge_alpha,
+                                 fit_intercept=True, solver='auto',
+                                 random_state=42)
+        self.ridge_model.fit(X_train_s, y_train)
+
+        print(f"Training MGO-XGBoost ({TOTAL_ITERATIONS} rounds)...")
+        xgb_p = self.xgb_params.copy()
+        xgb_p.pop('early_stopping_rounds', None)
+        self.xgb_model = xgb.XGBRegressor(
+            **xgb_p, random_state=42, verbosity=0, eval_metric='rmse')
+        self.xgb_model.fit(X_train_s, y_train,
+                           eval_set=[(X_val_s, y_val)], verbose=False)
+        self.xgb_history = self.xgb_model.evals_result()
+        return self.ann_history
+
+    def get_individual_predictions(self, X):
+        X_s = self.scaler.transform(X)
+        return np.column_stack([
+            self.ann_model.predict(X_s, verbose=0).flatten(),
+            self.ridge_model.predict(X_s),
+            self.xgb_model.predict(X_s)])
+
+    def optimize_weights_improved(self, X_train, y_train):
+        print(f"Optimizing weights (Improved MGO, {self.n_iterations} iterations)...")
+        base_preds = self.get_individual_predictions(X_train)
+        y_arr = np.asarray(y_train).ravel()
+        y_mean = float(np.mean(y_arr))
+        ss_tot = float(np.sum((y_arr - y_mean) ** 2))
+
+        def fitness(w):
+            w = np.abs(w); w = w / (np.sum(w) + 1e-12)
+            diff = base_preds @ w - y_arr
+            mse = np.mean(diff * diff)
+            mae = np.mean(np.abs(diff))
+            ss_res = float(np.sum(diff * diff))
+            r2 = 1.0 - ss_res / (ss_tot + 1e-12)
+            f = np.sqrt(mse) + 0.5 * mae - 0.2 * r2
+            f += 0.01 * np.sum(w ** 2)
+            f += 0.001 * np.sum(np.abs(np.diff(w)))
+            return f
+
+        self.mgo = ImprovedMountainGazelleOptimization(
+            n_gazelles=self.n_gazelles, n_iterations=self.n_iterations,
+            lb=0.01, ub=5.0, alpha=MGO_ALPHA,
+            F_min=MGO_F_MIN, F_max=MGO_F_MAX)
+        self.mgo.initialize_population(dim=MGO_DIM)
+        for it in range(self.n_iterations):
+            self.mgo.evaluate_fitness(fitness)
+            self.mgo.update_positions(it)
+            self.convergence_history.append(self.mgo.best_fitness)
+            if (it + 1) % 100 == 0:
+                print(f"  Iter {it+1}/{self.n_iterations}  "
+                      f"Best fitness: {self.mgo.best_fitness:.4f}")
+
+        self.optimal_weights = np.abs(self.mgo.best_position)
+        self.optimal_weights /= self.optimal_weights.sum()
+        return self.optimal_weights
+
+    def predict(self, X):
+        return np.sum(self.get_individual_predictions(X) *
+                      self.optimal_weights, axis=1)
+
+    def evaluate_individual_models(self, X, y_true):
+        X_s = self.scaler.transform(X); res = {}
+        ann = self.ann_model.predict(X_s, verbose=0).flatten()
+        res['MGO_ANN'] = {'Predictions': ann,
+                          'R2': r2_score(y_true, ann),
+                          'RMSE': np.sqrt(mean_squared_error(y_true, ann)),
+                          'MAE': mean_absolute_error(y_true, ann)}
+        ridge = self.ridge_model.predict(X_s)
+        res['MGO_Ridge'] = {'Predictions': ridge,
+                            'R2': r2_score(y_true, ridge),
+                            'RMSE': np.sqrt(mean_squared_error(y_true, ridge)),
+                            'MAE': mean_absolute_error(y_true, ridge)}
+        xgb_p = self.xgb_model.predict(X_s)
+        res['MGO_XGBoost'] = {'Predictions': xgb_p,
+                              'R2': r2_score(y_true, xgb_p),
+                              'RMSE': np.sqrt(mean_squared_error(y_true, xgb_p)),
+                              'MAE': mean_absolute_error(y_true, xgb_p)}
+        return res
+
+    def evaluate_comprehensive(self, X, y_true):
+        p = self.predict(X)
+        return {'RMSE': np.sqrt(mean_squared_error(y_true, p)),
+                'MAE': mean_absolute_error(y_true, p),
+                'R2': r2_score(y_true, p),
+                'MAPE': np.mean(np.abs((y_true - p) /
+                              np.maximum(np.abs(y_true), 1e-8))) * 100,
+                'Correlation': np.corrcoef(y_true, p)[0, 1],
+                'Predictions': p, 'Weights': self.optimal_weights,
+                'Convergence': self.convergence_history}
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+def build_split_rows(basic_model, improved_model, X, y):
+    b_ind = basic_model.evaluate_individual_models(X, y)
+    b_ens = basic_model.evaluate(X, y)
+    i_ind = improved_model.evaluate_individual_models(X, y)
+    i_ens = improved_model.evaluate_comprehensive(X, y)
+    return [
+        ('MGO-ANN',        i_ind['MGO_ANN']),
+        ('MGO Ensemble',   i_ens),
+        ('MGO-XGBoost',    i_ind['MGO_XGBoost']),
+        ('Plain XGBoost',  b_ind['Plain_XGBoost']),
+        ('Basic Ensemble', b_ens),
+        ('Plain ANN',      b_ind['Plain_ANN']),
+        ('MGO-Ridge',      i_ind['MGO_Ridge']),
+        ('Plain Ridge',    b_ind['Plain_Ridge']),
+    ]
+
+
+def print_split_table(title, rows):
+    print("\n" + "=" * 66); print(title); print("=" * 66)
+    header = f"{'Model':<16}{'R²':>10}{'MAE':>12}{'RMSE':>12}"
+    print(header); print("-" * len(header))
+    for name, r in rows:
+        print(f"{name:<16}{r['R2']:>10.3f}"
+              f"{r['MAE']:>12.3f}{r['RMSE']:>12.3f}")
+    print("-" * len(header))
+
+
+# =============================================================================
+# PLOTS
+# =============================================================================
+def plot_train_val_test(train_rows, val_rows, test_rows, feature_names):
+    names = [r[0] for r in train_rows]
+    tr = {k: [r[1][k] for r in train_rows] for k in ('R2', 'RMSE', 'MAE')}
+    va = {k: [r[1][k] for r in val_rows] for k in ('R2', 'RMSE', 'MAE')}
+    te = {k: [r[1][k] for r in test_rows] for k in ('R2', 'RMSE', 'MAE')}
+    x = np.arange(len(names)); w = 0.27
+    fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+    for ax, key, title, ylab in zip(
+            axes, ['R2', 'RMSE', 'MAE'],
+            ['R² (Train / Val / Test)',
+             'RMSE (Train / Val / Test)',
+             'MAE (Train / Val / Test)'],
+            ['R²', 'RMSE', 'MAE']):
+        ax.bar(x - w, tr[key], w, label='Train', color='#4C72B0', alpha=0.85, edgecolor='black')
+        ax.bar(x,     va[key], w, label='Validation', color='#55A868', alpha=0.85, edgecolor='black')
+        ax.bar(x + w, te[key], w, label='Test', color='#DD8452', alpha=0.85, edgecolor='black')
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=30, ha='right', fontsize=10)
+        ax.set_ylabel(ylab, fontsize=12, fontweight='bold')
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.legend(); ax.grid(True, alpha=0.6, axis='y')
+    plt.suptitle(
+        'TRAIN / VALIDATION / TEST METRICS — All Models\n'
+        f'MGO: α={MGO_ALPHA}, F∈[{MGO_F_MIN},{MGO_F_MAX}], '
+        f'NOP={MGO_NOP}, NOG={MGO_NOG}, D={MGO_DIM}  |  '
+        f'Features: {", ".join(feature_names)}',
+        fontsize=12, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig('Train_Val_Test_Comparison.png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.show()
+
+
+def plot_test_scatter(test_rows, y_test):
+    fig, ax = plt.subplots(figsize=(8, 7))
+    lookup = dict(test_rows)
+    for name, color, marker in [
+            ('MGO-ANN',        '#d62728', 'o'),
+            ('MGO-XGBoost',    '#8c564b', 's'),
+            ('Basic Ensemble', '#2E5A88', '^'),
+            ('MGO Ensemble',   '#FF6B35', 'D')]:
+        r = lookup[name]
+        ax.scatter(y_test, r['Predictions'], alpha=0.55, s=50,
+                   color=color, marker=marker,
+                   label=f'{name} (R²={r["R2"]:.3f})')
+    lo = min(y_test.min(), min(lookup[n]['Predictions'].min() for n in lookup))
+    hi = max(y_test.max(), max(lookup[n]['Predictions'].max() for n in lookup))
+    ax.plot([lo, hi], [lo, hi], 'k--', lw=2, alpha=0.6)
+    ax.set_xlabel('Actual CBR'); ax.set_ylabel('Predicted CBR')
+    ax.set_title('TEST-set Predictions — Headline Models', fontsize=13, fontweight='bold')
+    ax.legend(); ax.grid(True, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig('Test_Predictions_Scatter.png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.show()
+
+
+def plot_ann_rmse_convergence(basic_hist, improved_hist, basic_test, improved_test):
+    if basic_hist is None or improved_hist is None:
+        return
+    bh, ih = basic_hist.history, improved_hist.history
+
+    b_tr = np.sqrt(bh['loss']); b_va = np.sqrt(bh['val_loss'])
+    i_tr = np.sqrt(ih['loss']); i_va = np.sqrt(ih['val_loss'])
+
+    plt.figure(figsize=(10, 6))
+
+    # Plain ANN (TOTAL_ITERATIONS epochs)
+    plt.plot(b_tr, color='#4C72B0', lw=2, label=f'Plain ANN — Train RMSE ({len(b_tr)} ep)')
+    plt.plot(b_va, color='#4C72B0', lw=1.5, ls='--', label='Plain ANN — Val RMSE')
+    plt.plot(basic_test, color='#4C72B0', lw=1.5, ls=':', label='Plain ANN — Test RMSE')
+
+    # MGO-ANN (MGO_ANN_EPOCHS epochs)
+    plt.plot(i_tr, color='#FF6B35', lw=2, label=f'MGO-ANN — Train RMSE ({len(i_tr)} ep)')
+    plt.plot(i_va, color='#FF6B35', lw=1.5, ls='--', label='MGO-ANN — Val RMSE')
+    plt.plot(improved_test, color='#FF6B35', lw=1.5, ls=':', label='MGO-ANN — Test RMSE')
+
+    plt.xlabel('Epoch')
+    plt.ylabel('RMSE')
+    plt.title(
+        f'Plain ANN ({TOTAL_ITERATIONS} epochs) vs MGO-ANN ({MGO_ANN_EPOCHS} epochs)\n'
+        'Train / Val / Test RMSE Convergence', fontweight='bold')
+    plt.xlim(0, MAX_EPOCHS)
+    plt.grid(True, alpha=0.6)
+    plt.legend(loc='upper right')
+    plt.tight_layout()
+    plt.savefig('ANN_RMSE_Convergence_Plain_vs_MGO.png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.show()
+
+
+def plot_all_convergence(basic_model, improved_model):
+    fig, axes = plt.subplots(1, 3, figsize=(22, 5.5))
+
+    # Panel 1: ANN
+    ax = axes[0]
+    bh = basic_model.ann_history.history
+    ih = improved_model.ann_history.history
+    b_tr = np.sqrt(bh['loss']); b_va = np.sqrt(bh['val_loss'])
+    i_tr = np.sqrt(ih['loss']); i_va = np.sqrt(ih['val_loss'])
+
+    ax.plot(b_tr, color='#4C72B0', lw=1.8, label=f'Plain ANN — Train ({len(b_tr)} ep)')
+    ax.plot(b_va, color='#4C72B0', lw=1.4, ls='--', label='Plain ANN — Val')
+    ax.plot(basic_model.test_rmse_history, color='#4C72B0', lw=1.4, ls=':', label='Plain ANN — Test')
+
+    ax.plot(i_tr, color='#FF6B35', lw=1.8, label=f'MGO-ANN — Train ({len(i_tr)} ep)')
+    ax.plot(i_va, color='#FF6B35', lw=1.4, ls='--', label='MGO-ANN — Val')
+    ax.plot(improved_model.test_rmse_history, color='#FF6B35', lw=1.4, ls=':', label='MGO-ANN — Test')
+
+    ax.set_xlabel('Epoch'); ax.set_ylabel('RMSE')
+    ax.set_title(
+        f'ANN Training Convergence\n(Plain ANN={TOTAL_ITERATIONS} ep, MGO-ANN={MGO_ANN_EPOCHS} ep)',
+        fontweight='bold')
+    ax.set_xlim(0, MAX_EPOCHS)
+    ax.grid(True, alpha=0.6); ax.legend(fontsize=8, loc='upper right')
+
+    # Panel 2: XGBoost (both at TOTAL_ITERATIONS = 500)
+    ax = axes[1]
+    if basic_model.xgb_history and 'validation_0' in basic_model.xgb_history:
+        b_curve = basic_model.xgb_history['validation_0']['rmse']
+        ax.plot(b_curve, color='#4C72B0', lw=1.8, label=f'Plain XGBoost ({len(b_curve)} rounds)')
+    if improved_model.xgb_history and 'validation_0' in improved_model.xgb_history:
+        i_curve = improved_model.xgb_history['validation_0']['rmse']
+        ax.plot(i_curve, color='#FF6B35', lw=1.8, label=f'MGO-XGBoost ({len(i_curve)} rounds)')
+    ax.set_xlabel('Boosting Round'); ax.set_ylabel('Validation RMSE')
+    ax.set_title(f'XGBoost Training Convergence ({TOTAL_ITERATIONS} Rounds)', fontweight='bold')
+    ax.set_xlim(0, TOTAL_ITERATIONS)
+    ax.grid(True, alpha=0.6); ax.legend(fontsize=9, loc='upper right')
+
+    # Panel 3: MGO weight search (both at MGO_NOG = 500)
+    ax = axes[2]
+    ax.plot(basic_model.convergence_history, color='#4C72B0', lw=2, label='Basic MGO')
+    ax.plot(improved_model.convergence_history, color='#FF6B35', lw=2, label='Improved MGO')
+    ax.set_xlabel('Iteration'); ax.set_ylabel('Best Fitness (TRAIN)')
+    ax.set_title(f'MGO Weight-Search Convergence ({MGO_NOG} Iters)', fontweight='bold')
+    ax.set_xlim(0, MGO_NOG)
+    ax.grid(True, alpha=0.6); ax.legend(fontsize=9, loc='upper right')
+
+    plt.suptitle(
+        'Convergence of ALL Models — MGO-ANN extended to 1000 epochs\n'
+        f'(Plain ANN={TOTAL_ITERATIONS}, XGBoost={TOTAL_ITERATIONS}, '
+        f'MGO weight-search={MGO_NOG})   |   α={MGO_ALPHA}',
+        fontsize=12, fontweight='bold', y=1.03)
+    plt.tight_layout()
+    plt.savefig('All_Models_Convergence.png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.show()
+
+
+# =============================================================================
+# 5-FOLD CROSS-VALIDATION  ×  3 REPEATS  →  MEAN ± SD
+# =============================================================================
+def run_cross_validation(X, y, n_splits=5, n_repeats=3, random_state=42):
+    from sklearn.model_selection import KFold
+
+    model_names = ['Plain ANN', 'Plain Ridge', 'Plain XGBoost', 'Basic Ensemble',
+                   'MGO-ANN', 'MGO-Ridge', 'MGO-XGBoost', 'MGO Ensemble']
+    results = {name: {'R2': [], 'MAE': [], 'RMSE': []} for name in model_names}
+
+    total_fits = n_splits * n_repeats
+    fit_counter = 0
+
+    for repeat in range(n_repeats):
+        kf = KFold(n_splits=n_splits, shuffle=True,
+                   random_state=random_state + repeat)
+        for fold_idx, (train_val_idx, test_idx) in enumerate(kf.split(X)):
+            fit_counter += 1
+            print(f"\n[CV {fit_counter}/{total_fits}] "
+                  f"Repeat {repeat+1}/{n_repeats}, Fold {fold_idx+1}/{n_splits}")
+
+            X_tv, X_test_cv = X[train_val_idx], X[test_idx]
+            y_tv, y_test_cv = y[train_val_idx], y[test_idx]
+
+            # small validation slice for ANN plateau callback / XGB eval
+            X_tr, X_val_cv, y_tr, y_val_cv = train_test_split(
+                X_tv, y_tv, test_size=0.15,
+                random_state=random_state + repeat * 100 + fold_idx)
+
+            # ---- BASIC (500 epochs) ----
+            bm = BasicHybridModel(
+                ann_units=[64, 32], ridge_alpha=1.0,
+                xgb_params={'max_depth': 6, 'learning_rate': 0.1,
+                            'n_estimators': TOTAL_ITERATIONS},
+                n_gazelles=MGO_NOP, n_iterations=MGO_NOG)
+            bm.train_base_models(X_tr, y_tr, X_val_cv, y_val_cv,
+                                 X_test_cv, y_test_cv, epochs=TOTAL_ITERATIONS)
+            bm.optimize_weights(X_tr, y_tr)
+
+            # ---- IMPROVED (MGO-ANN at 1000 epochs) ----
+            im = ImprovedHybridModel(
+                ann_units=[128, 64, 32], ridge_alpha=0.5,
+                xgb_params={'max_depth': 10, 'learning_rate': 0.05,
+                            'n_estimators': TOTAL_ITERATIONS,
+                            'subsample': 0.8, 'colsample_bytree': 0.9,
+                            'reg_alpha': 0.1, 'reg_lambda': 0.1},
+                n_gazelles=MGO_NOP, n_iterations=MGO_NOG)
+            im.train_improved_base_models(X_tr, y_tr, X_val_cv, y_val_cv,
+                                          X_test_cv, y_test_cv,
+                                          epochs=MGO_ANN_EPOCHS)
+            im.optimize_weights_improved(X_tr, y_tr)
+
+            # ---- EVALUATE on held-out fold ----
+            b_ind = bm.evaluate_individual_models(X_test_cv, y_test_cv)
+            b_ens = bm.evaluate(X_test_cv, y_test_cv)
+            i_ind = im.evaluate_individual_models(X_test_cv, y_test_cv)
+            i_ens = im.evaluate_comprehensive(X_test_cv, y_test_cv)
+
+            snapshot = {
+                'Plain ANN':      b_ind['Plain_ANN'],
+                'Plain Ridge':    b_ind['Plain_Ridge'],
+                'Plain XGBoost':  b_ind['Plain_XGBoost'],
+                'Basic Ensemble': b_ens,
+                'MGO-ANN':        i_ind['MGO_ANN'],
+                'MGO-Ridge':      i_ind['MGO_Ridge'],
+                'MGO-XGBoost':    i_ind['MGO_XGBoost'],
+                'MGO Ensemble':   i_ens,
+            }
+            for name, r in snapshot.items():
+                results[name]['R2'].append(float(r['R2']))
+                results[name]['MAE'].append(float(r['MAE']))
+                results[name]['RMSE'].append(float(r['RMSE']))
+
+    # ------------------------ REPORT: MEAN ± SD ------------------------
+    print("\n" + "=" * 96)
+    print(f"5-FOLD CV × 3 REPEATS  ({total_fits} fits per model)  —  MEAN ± SD")
+    print("=" * 96)
+    header = (f"{'Model':<16}"
+              f"{'R²  (mean ± SD)':>26}"
+              f"{'MAE (mean ± SD)':>26}"
+              f"{'RMSE (mean ± SD)':>26}")
+    print(header); print("-" * len(header))
+
+    rows = []
+    for name in model_names:
+        r2   = np.array(results[name]['R2'])
+        mae  = np.array(results[name]['MAE'])
+        rmse = np.array(results[name]['RMSE'])
+        r2_m,   r2_s   = float(np.mean(r2)),   float(np.std(r2,   ddof=1))
+        mae_m,  mae_s  = float(np.mean(mae)),  float(np.std(mae,  ddof=1))
+        rmse_m, rmse_s = float(np.mean(rmse)), float(np.std(rmse, ddof=1))
+        print(f"{name:<16}"
+              f"{f'{r2_m:.3f} ± {r2_s:.3f}':>26}"
+              f"{f'{mae_m:.3f} ± {mae_s:.3f}':>26}"
+              f"{f'{rmse_m:.3f} ± {rmse_s:.3f}':>26}")
+        rows.append({
+            'Model': name,
+            'R2_mean':   r2_m,  'R2_SD':   r2_s,
+            'MAE_mean':  mae_m, 'MAE_SD':  mae_s,
+            'RMSE_mean': rmse_m,'RMSE_SD': rmse_s,
+            'n_fits': total_fits,
+        })
+
+    pd.DataFrame(rows).to_csv('CV_5x3_MeanSD.csv', index=False)
+
+    long_rows = []
+    for name in model_names:
+        for i in range(total_fits):
+            long_rows.append({
+                'Model': name, 'Fit': i + 1,
+                'R2':   results[name]['R2'][i],
+                'MAE':  results[name]['MAE'][i],
+                'RMSE': results[name]['RMSE'][i],
+            })
+    pd.DataFrame(long_rows).to_csv('CV_5x3_AllFits.csv', index=False)
+
+    print("\nSaved: CV_5x3_MeanSD.csv    — mean ± SD summary")
+    print("Saved: CV_5x3_AllFits.csv   — every individual fit")
+    return results
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def main():
+    file_path = "SPSS2.xlsx"
+    use_sample = False
+    if not os.path.exists(file_path):
+        print(f"File '{file_path}' not found. Using synthetic sample data.")
+        use_sample = True
+
+    if use_sample:
+        from sklearn.datasets import make_regression
+        X, y = make_regression(n_samples=500, n_features=6, noise=8.0,
+                               random_state=42)
+        feature_columns = [f'X{i+1}' for i in range(6)]
+        df = pd.DataFrame(X, columns=feature_columns)
+        df.insert(0, 'CBR', y)
+    else:
+        df = pd.read_excel(file_path, sheet_name=0)
+        for c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df = df.dropna().reset_index(drop=True)
+        if len(df.columns) > 7:
+            df = df.iloc[:, :7]
+        feature_columns = [f'X{i+1}' for i in range(len(df.columns) - 1)]
+        df.columns = ['CBR'] + feature_columns
+
+    X = df[feature_columns].values
+    y = df['CBR'].values
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.15, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.15, random_state=42)
+
+    print("=" * 70); print("DATA PROTOCOL"); print("=" * 70)
+    print(f"  Train : {X_train.shape[0]}  ({100*X_train.shape[0]/len(X):.1f} %)")
+    print(f"  Val   : {X_val.shape[0]}  ({100*X_val.shape[0]/len(X):.1f} %)")
+    print(f"  Test  : {X_test.shape[0]}  ({100*X_test.shape[0]/len(X):.1f} %)")
+    print(f"  Features: {feature_columns}")
+    print(f"  Epochs: Plain ANN={TOTAL_ITERATIONS}, MGO-ANN={MGO_ANN_EPOCHS}, "
+          f"XGBoost={TOTAL_ITERATIONS}, MGO-weight-search={MGO_NOG}")
+
+    # ---------- BASIC MODELS ----------
+    print("\n" + "=" * 70); print(f"BASIC MODELS ({TOTAL_ITERATIONS} Epochs)"); print("=" * 70)
+    basic_model = BasicHybridModel(
+        ann_units=[64, 32], ridge_alpha=1.0,
+        xgb_params={'max_depth': 6, 'learning_rate': 0.1, 'n_estimators': TOTAL_ITERATIONS},
+        n_gazelles=MGO_NOP, n_iterations=MGO_NOG)
+    basic_model.train_base_models(X_train, y_train, X_val, y_val, X_test, y_test,
+                                  epochs=TOTAL_ITERATIONS)
+    basic_model.optimize_weights(X_train, y_train)
+
+    # ---------- IMPROVED MODELS (MGO-ANN = 1000 epochs) ----------
+    print("\n" + "=" * 70); print(f"MGO-OPTIMIZED MODELS (MGO-ANN {MGO_ANN_EPOCHS} Epochs)"); print("=" * 70)
+    improved_model = ImprovedHybridModel(
+        ann_units=[128, 64, 32], ridge_alpha=0.5,
+        xgb_params={'max_depth': 10, 'learning_rate': 0.05,
+                    'n_estimators': TOTAL_ITERATIONS, 'subsample': 0.8,
+                    'colsample_bytree': 0.9,
+                    'reg_alpha': 0.1, 'reg_lambda': 0.1},
+        n_gazelles=MGO_NOP, n_iterations=MGO_NOG)
+    improved_model.train_improved_base_models(X_train, y_train, X_val, y_val, X_test, y_test,
+                                              epochs=MGO_ANN_EPOCHS)
+    improved_model.optimize_weights_improved(X_train, y_train)
+
+    # ---------- METRICS ----------
+    train_rows = build_split_rows(basic_model, improved_model, X_train, y_train)
+    val_rows   = build_split_rows(basic_model, improved_model, X_val,   y_val)
+    test_rows  = build_split_rows(basic_model, improved_model, X_test,  y_test)
+
+    print_split_table(f"TABLE 1 — TRAIN METRICS (n={X_train.shape[0]})", train_rows)
+    print_split_table(f"TABLE 2 — VALIDATION METRICS (n={X_val.shape[0]})", val_rows)
+    print_split_table(f"TABLE 3 — TEST METRICS (n={X_test.shape[0]})", test_rows)
+
+    all_rows = []
+    for split_name, rows in [('train', train_rows),
+                              ('validation', val_rows),
+                              ('test', test_rows)]:
+        for name, r in rows:
+            all_rows.append({'Split': split_name, 'Model': name,
+                             'R2': r['R2'], 'MAE': r['MAE'],
+                             'RMSE': r['RMSE']})
+    pd.DataFrame(all_rows).to_csv('Metrics_AllSplits.csv', index=False)
+
+    # ---------- PLOTS ----------
+    plot_train_val_test(train_rows, val_rows, test_rows, feature_columns)
+    plot_test_scatter(test_rows, y_test)
+    plot_ann_rmse_convergence(basic_model.ann_history, improved_model.ann_history,
+                              basic_model.test_rmse_history, improved_model.test_rmse_history)
+    plot_all_convergence(basic_model, improved_model)
+
+    # ---------- PER-SAMPLE EXPORT ----------
+    def rows_to_df(split_name, X, y, b, i):
+        b_ind = b.evaluate_individual_models(X, y)
+        i_ind = i.evaluate_individual_models(X, y)
+        return pd.DataFrame({
+            'Split': split_name, 'Actual': y,
+            'Plain_ANN': b_ind['Plain_ANN']['Predictions'],
+            'Plain_Ridge': b_ind['Plain_Ridge']['Predictions'],
+            'Plain_XGBoost': b_ind['Plain_XGBoost']['Predictions'],
+            'MGO_ANN': i_ind['MGO_ANN']['Predictions'],
+            'MGO_Ridge': i_ind['MGO_Ridge']['Predictions'],
+            'MGO_XGBoost': i_ind['MGO_XGBoost']['Predictions'],
+            'Basic_Ensemble': b.predict(X),
+            'MGO_Ensemble': i.predict(X)})
+
+    pd.concat([
+        rows_to_df('train', X_train, y_train, basic_model, improved_model),
+        rows_to_df('validation', X_val, y_val, basic_model, improved_model),
+        rows_to_df('test', X_test, y_test, basic_model, improved_model),
+    ]).to_csv('All_Models_Detailed_Results.csv', index=False)
+
+    # ---------- CONVERGENCE HISTORY EXPORT (padded with NaN) ----------
+    try:
+        bh = basic_model.ann_history.history
+        ih = improved_model.ann_history.history
+
+        def pad(arr, n):
+            out = np.full(n, np.nan, dtype=float)
+            arr = np.asarray(arr, dtype=float)
+            out[:len(arr)] = arr
+            return out
+
+        pd.DataFrame({
+            'epoch':            np.arange(1, MAX_EPOCHS + 1),
+            'plain_train_rmse': pad(np.sqrt(bh['loss']), MAX_EPOCHS),
+            'plain_val_rmse':   pad(np.sqrt(bh['val_loss']), MAX_EPOCHS),
+            'plain_test_rmse':  pad(basic_model.test_rmse_history, MAX_EPOCHS),
+            'mgo_train_rmse':   pad(np.sqrt(ih['loss']), MAX_EPOCHS),
+            'mgo_val_rmse':     pad(np.sqrt(ih['val_loss']), MAX_EPOCHS),
+            'mgo_test_rmse':    pad(improved_model.test_rmse_history, MAX_EPOCHS),
+        }).to_csv('ANN_RMSE_History.csv', index=False)
+
+        pd.DataFrame({
+            'iteration': np.arange(1, MGO_NOG + 1),
+            'basic_mgo_fitness':    basic_model.convergence_history,
+            'improved_mgo_fitness': improved_model.convergence_history,
+        }).to_csv('MGO_Convergence_History.csv', index=False)
+    except Exception as e:
+        print(f"[warn] CSV export failed: {e}")
+
+    print("\n" + "=" * 70); print("FILES SAVED"); print("=" * 70)
+    print("  Metrics_AllSplits.csv                 — 3 tables")
+    print("  All_Models_Detailed_Results.csv       — per-sample predictions")
+    print("  ANN_RMSE_History.csv                  — Plain ANN (500) + MGO-ANN (1000), NaN-padded")
+    print("  MGO_Convergence_History.csv           — MGO curves (500 iterations)")
+    print("  Train_Val_Test_Comparison.png         — bar chart")
+    print("  Test_Predictions_Scatter.png          — test scatter")
+    print("  ANN_RMSE_Convergence_Plain_vs_MGO.png — 500 vs 1000 epochs")
+    print("  All_Models_Convergence.png            — 3-panel combined plot")
+
+    # ---------- 5-FOLD CV × 3 REPEATS ----------
+    print("\n" + "=" * 70)
+    print("5-FOLD CROSS-VALIDATION  ×  3 REPEATS  →  MEAN ± SD")
+    print(f"(MGO-ANN trained for {MGO_ANN_EPOCHS} epochs per fold)")
+    print("=" * 70)
+    run_cross_validation(X, y, n_splits=5, n_repeats=3, random_state=42)
+
+
+if __name__ == "__main__":
+    main()
